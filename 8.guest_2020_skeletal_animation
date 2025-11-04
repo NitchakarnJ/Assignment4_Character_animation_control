@@ -1,0 +1,397 @@
+
+#include <glad/glad.h>
+#include <GLFW/glfw3.h>
+
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
+
+#include <learnopengl/filesystem.h>
+#include <learnopengl/shader_m.h>
+#include <learnopengl/camera.h>
+#include <learnopengl/animator.h>
+#include <learnopengl/model_animation.h>
+
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
+
+#include <iostream>
+#include <fstream>
+#include <unordered_map>
+#include <vector>
+#include <string>
+#include <cmath>
+
+// ---------------- Window ----------------
+static const unsigned int SCR_WIDTH = 800;
+static const unsigned int SCR_HEIGHT = 600;
+
+// ---------------- Camera (we drive Position/Front) ----------------
+Camera camera(glm::vec3(0.0f, 1.5f, 3.0f));
+float lastX = SCR_WIDTH * 0.5f;
+float lastY = SCR_HEIGHT * 0.5f;
+bool  firstMouse = true;
+
+// ---------------- Timing ----------------
+float deltaTime = 0.0f;
+float lastFrame = 0.0f;
+
+// ---------------- Orbit camera params ----------------
+float camRadius = 3.0f;
+float camYawOffsetDeg = 0.0f;
+float camPitchDeg = 40.0f;   // ~45°
+float camPitchMin = 10.0f, camPitchMax = 80.0f;
+float orbitSensitivity = 0.15f;
+float zoomSensitivity = 0.25f;
+
+// ---------------- Character & animation ----------------
+enum class AnimState { Idle, Walk, Run, Wave };
+
+struct Character {
+    Model* model = nullptr;
+    std::unordered_map<AnimState, Animation*> clips; // all clips must share the same rig
+    Animator* animator = nullptr;
+    AnimState state = AnimState::Idle;
+
+    glm::vec3 pos = glm::vec3(0.0f);
+    float yawDeg = 0.0f; // rotation around Y
+};
+
+// movement config
+float moveSpeedWalk = 1.8f;
+float moveSpeedRun = 3.8f;
+float moveSpeedCurr = 0.0f;    // smoothed speed
+
+// --------- Utilities ----------
+static bool fileExists(const std::string& p) { std::ifstream f(p); return f.good(); }
+static bool key(GLFWwindow* w, int k) { return glfwGetKey(w, k) == GLFW_PRESS; }
+
+// ================== Phase tracker (no engine change) ==================
+struct ClipMeta {
+    float seconds = 0.0f; // clip length in seconds
+    float phase = 0.0f; // normalized 0..1
+};
+std::unordered_map<AnimState, ClipMeta> gClip;
+
+static float clipSeconds(Animation* clip) {
+    float tps = clip->GetTicksPerSecond() > 0.0f ? clip->GetTicksPerSecond() : 25.0f;
+    return clip->GetDuration() / tps;
+}
+
+// Jump Animator to a normalized phase of a clip
+static void animatorJumpToPhase(Animator* anim, Animation* clip, float phase) {
+    float secs = clipSeconds(clip);
+    float want = secs * fmodf(glm::clamp(phase, 0.0f, 0.999f), 1.0f);
+    anim->PlayAnimation(clip);     // reset to start
+    anim->UpdateAnimation(want);   // fast-forward
+    if (secs - want < 1e-4f) {
+        anim->UpdateAnimation(-1e-3f); // avoid sampling exact end
+    }
+}
+
+// ================== Crossfade (simple) ==================
+struct CrossFade {
+    bool  active = false;
+    float duration = 0.25f; // default
+    float t = 0.0f;
+    AnimState from = AnimState::Idle;
+    float fromPhase = 0.0f;
+} gFade;
+
+// ======= Callbacks =======
+void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
+    glViewport(0, 0, width, height);
+}
+void mouse_callback(GLFWwindow* window, double xpos, double ypos) {
+    static bool first = true;
+    static double px = 0, py = 0;
+    if (first) { px = xpos; py = ypos; first = false; return; }
+    double dx = xpos - px, dy = ypos - py; px = xpos; py = ypos;
+
+    camYawOffsetDeg -= (float)dx * orbitSensitivity;  // horizontal orbit
+    camPitchDeg += (float)dy * orbitSensitivity;  // vertical tilt
+    camPitchDeg = glm::clamp(camPitchDeg, camPitchMin, camPitchMax);
+}
+void scroll_callback(GLFWwindow* window, double, double yoffset) {
+    camRadius -= (float)yoffset * zoomSensitivity;
+    camRadius = glm::clamp(camRadius, 1.2f, 8.0f);
+}
+
+// ================== Smooth switch (phase control + cross-fade) ==================
+// preservePhase=false → start from frame 0 of target clip (used when starting a new hold)
+// preservePhase=true  → keep current normalized phase (used when switching Walk<->Run mid-hold)
+static void switchAnimSmooth(Character& p, AnimState next, bool preservePhase, float customFade = -1.0f) {
+    if (p.state == next && preservePhase) return; // no change
+
+    auto it = p.clips.find(next);
+    if (it == p.clips.end()) return;
+
+    float prevPhase = gClip[p.state].phase;
+
+    // fade time
+    if (customFade > 0.0f) {
+        gFade.duration = customFade;
+    }
+    else if ((p.state == AnimState::Walk && next == AnimState::Run) ||
+        (p.state == AnimState::Run && next == AnimState::Walk)) {
+        gFade.duration = 0.30f; // a bit longer between locomotions
+    }
+    else {
+        gFade.duration = 0.25f;
+    }
+
+    gFade.active = true;
+    gFade.t = 0.0f;
+    gFade.from = p.state;
+    gFade.fromPhase = prevPhase;
+
+    float newPhase = preservePhase ? prevPhase : 0.0f; // << core requirement
+    animatorJumpToPhase(p.animator, it->second, newPhase);
+    gClip[next].phase = newPhase;
+
+    p.state = next;
+}
+
+// Immediate Idle (hard stop)
+static void switchAnimImmediateIdle(Character& p) {
+    gFade.active = false; gFade.t = 0.0f;
+    auto it = p.clips.find(AnimState::Idle);
+    if (it != p.clips.end()) {
+        p.state = AnimState::Idle;
+        animatorJumpToPhase(p.animator, it->second, 0.0f);
+        gClip[AnimState::Idle].phase = 0.0f;
+    }
+}
+
+// ================== Input (hold-to-move) ==================
+static void processInput(GLFWwindow* window, Character& player) {
+    if (key(window, GLFW_KEY_ESCAPE)) glfwSetWindowShouldClose(window, true);
+
+    // build movement vector from WASD + arrows
+    glm::vec2 mv(0.0f);
+    if (key(window, GLFW_KEY_W) || key(window, GLFW_KEY_UP))    mv.y += 1.0f;
+    if (key(window, GLFW_KEY_S) || key(window, GLFW_KEY_DOWN))  mv.y -= 1.0f;
+    if (key(window, GLFW_KEY_D) || key(window, GLFW_KEY_RIGHT)) mv.x += 1.0f;
+    if (key(window, GLFW_KEY_A) || key(window, GLFW_KEY_LEFT))  mv.x -= 1.0f;
+
+    bool moving = (mv.x != 0.0f || mv.y != 0.0f);
+    bool running = key(window, GLFW_KEY_LEFT_SHIFT) || key(window, GLFW_KEY_RIGHT_SHIFT);
+
+    // Rotate to face move direction (if moving)
+    if (moving) {
+        float targetYaw = glm::degrees(atan2f(mv.x, -mv.y)); // screen-space to facing
+        // smooth face direction
+        float diff = glm::mod(targetYaw - player.yawDeg + 540.0f, 360.0f) - 180.0f;
+        player.yawDeg += glm::clamp(diff, -360.0f * deltaTime, 360.0f * deltaTime);
+    }
+
+    // ----- Animation state & movement speed -----
+    if (moving) {
+        // choose state (run if shift, else walk)
+        AnimState next = running ? AnimState::Run : AnimState::Walk;
+
+        // if we're starting to move from Idle (or Wave), start clip from frame 0 (no old phase)
+        bool startingNewHold = (player.state == AnimState::Idle || player.state == AnimState::Wave);
+
+        // if switching Walk<->Run while still moving, preserve phase for leg continuity
+        bool preserve = !startingNewHold;
+
+        switchAnimSmooth(player, next, preserve);
+
+        // smooth speed toward target
+        float targetSpeed = running ? moveSpeedRun : moveSpeedWalk;
+        float accelSmooth = running ? 9.0f : 6.0f;
+        moveSpeedCurr = glm::mix(moveSpeedCurr, targetSpeed, 1.0f - expf(-accelSmooth * deltaTime));
+
+        // move forward in faced direction
+        glm::vec3 fwd = glm::normalize(glm::vec3(
+            -sinf(glm::radians(player.yawDeg)), 0.0f, -cosf(glm::radians(player.yawDeg))
+        ));
+        player.pos += fwd * moveSpeedCurr * deltaTime;
+    }
+    else {
+        // release → stop to Idle (hard stop)
+        moveSpeedCurr = glm::mix(moveSpeedCurr, 0.0f, 1.0f - expf(-10.0f * deltaTime));
+        if (player.state != AnimState::Idle)
+            switchAnimImmediateIdle(player);
+    }
+
+    // Optional: Q/E additional yaw adjust
+    if (key(window, GLFW_KEY_Q)) player.yawDeg -= 120.0f * deltaTime;
+    if (key(window, GLFW_KEY_E)) player.yawDeg += 120.0f * deltaTime;
+
+    // Demo: SPACE = Wave (only when not moving)
+    if (!key(window, GLFW_KEY_SPACE)) return;
+    if (moveSpeedCurr < 0.01f) switchAnimSmooth(player, AnimState::Wave, false);
+}
+
+// ================== Main ==================
+int main() {
+    // GLFW init
+    glfwInit();
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+#ifdef __APPLE__
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
+#endif
+
+    GLFWwindow* window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, "Playable Character (Hold-to-move)", nullptr, nullptr);
+    if (!window) { std::cerr << "Failed to create GLFW window\n"; glfwTerminate(); return -1; }
+    glfwMakeContextCurrent(window);
+
+    glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
+    glfwSetCursorPosCallback(window, mouse_callback);
+    glfwSetScrollCallback(window, scroll_callback);
+    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED); // pointer lock
+
+    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
+        std::cerr << "Failed to initialize GLAD\n"; return -1;
+    }
+
+    stbi_set_flip_vertically_on_load(true);
+    glEnable(GL_DEPTH_TEST);
+
+    Shader skinned("anim_model.vs", "anim_model.fs");
+
+    // ---- Paths (adjust to your files) ----
+    // Idle model (with skin) + Walk/Run clips (without skin; In-Place; same rig)
+    std::string idlePath = FileSystem::getPath("resources/objects/Amy_Defeated/Defeated.dae");
+    std::string walkPath = FileSystem::getPath("resources/objects/Amy_Walking/Walking.dae");
+    std::string runPath = FileSystem::getPath("resources/objects/Amy_FastRun/Fast Run.dae");
+
+    if (!fileExists(idlePath)) { std::cerr << "[Missing] idle: " << idlePath << "\n"; return -1; }
+    if (!fileExists(walkPath)) { std::cerr << "[WARN] walk not found, fallback to idle\n"; walkPath = idlePath; }
+    if (!fileExists(runPath)) { std::cerr << "[WARN] run  not found, fallback to walk\n"; runPath = walkPath; }
+
+    // ---- Load model & animations ----
+    Character player;
+
+    Model model(idlePath);          // with skin
+    player.model = &model;
+
+    Animation idleClip(idlePath, player.model);
+    Animation walkClip(walkPath, player.model);
+    Animation runClip(runPath, player.model);
+    // simple wave = idle for now
+    Animation& waveClip = idleClip;
+
+    player.clips[AnimState::Idle] = &idleClip;
+    player.clips[AnimState::Walk] = &walkClip;
+    player.clips[AnimState::Run] = &runClip;
+    player.clips[AnimState::Wave] = &waveClip;
+
+    // meta (seconds)
+    gClip[AnimState::Idle].seconds = clipSeconds(&idleClip);
+    gClip[AnimState::Walk].seconds = clipSeconds(&walkClip);
+    gClip[AnimState::Run].seconds = clipSeconds(&runClip);
+    gClip[AnimState::Wave].seconds = gClip[AnimState::Idle].seconds;
+
+    Animator animator(player.clips[AnimState::Idle]);
+    player.animator = &animator;
+
+    gClip[player.state].phase = 0.0f; // start phase
+
+    // ---- Render loop ----
+    while (!glfwWindowShouldClose(window)) {
+        float current = (float)glfwGetTime();
+        deltaTime = current - lastFrame;
+        lastFrame = current;
+
+        processInput(window, player);
+
+        // advance phase of current clip
+        {
+            float secs = std::max(0.001f, gClip[player.state].seconds);
+            gClip[player.state].phase = fmodf(gClip[player.state].phase + (deltaTime / secs), 1.0f);
+        }
+
+        // Update Animator
+        player.animator->UpdateAnimation(deltaTime);
+
+        // avoid sampling exact end of loop
+        {
+            float secs = std::max(0.001f, gClip[player.state].seconds);
+            if (1.0f - gClip[player.state].phase < 1e-4f) {
+                gClip[player.state].phase = 1.0f - 1e-3f;
+                animatorJumpToPhase(player.animator, player.clips[player.state], gClip[player.state].phase);
+            }
+        }
+
+        // ----- Orbit camera (~45°) -----
+        {
+            float yawCam = player.yawDeg + camYawOffsetDeg;
+            float yawRad = glm::radians(yawCam);
+            float pitchRad = glm::radians(camPitchDeg);
+
+            glm::vec3 dir(
+                sinf(yawRad) * cosf(pitchRad),
+                sinf(pitchRad),
+                cosf(yawRad) * cosf(pitchRad)
+            );
+            dir = glm::normalize(dir);
+
+            glm::vec3 target = player.pos + glm::vec3(0.0f, 1.0f, 0.0f);
+            glm::vec3 desired = target + dir * camRadius;
+
+            float smooth = 14.0f;
+            camera.Position = glm::mix(camera.Position, desired, 1.0f - expf(-smooth * deltaTime));
+            camera.Front = glm::normalize(target - camera.Position);
+        }
+
+        // ----- Render -----
+        glClearColor(0.05f, 0.05f, 0.05f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        skinned.use();
+        glm::mat4 projection = glm::perspective(glm::radians(45.0f),
+            (float)SCR_WIDTH / (float)SCR_HEIGHT, 0.1f, 100.0f);
+        glm::mat4 view = camera.GetViewMatrix();
+        skinned.setMat4("projection", projection);
+        skinned.setMat4("view", view);
+
+        // Bone matrices (with optional crossfade)
+        if (!gFade.active) {
+            auto bones = player.animator->GetFinalBoneMatrices();
+            for (size_t i = 0; i < bones.size(); ++i)
+                skinned.setMat4("finalBonesMatrices[" + std::to_string(i) + "]", bones[i]);
+        }
+        else {
+            gFade.t += deltaTime;
+            float w = glm::clamp(gFade.t / gFade.duration, 0.0f, 1.0f);
+
+            auto bonesNew = player.animator->GetFinalBoneMatrices();
+
+            Animator tempOld(player.clips[gFade.from]);
+            animatorJumpToPhase(&tempOld, player.clips[gFade.from], gFade.fromPhase);
+            tempOld.UpdateAnimation(0.0f);
+            auto bonesOld = tempOld.GetFinalBoneMatrices();
+
+            size_t n = std::min(bonesOld.size(), bonesNew.size());
+            for (size_t i = 0; i < n; ++i) {
+                glm::mat4 m = bonesOld[i] * (1.0f - w) + bonesNew[i] * w; // matrix lerp
+                skinned.setMat4("finalBonesMatrices[" + std::to_string(i) + "]", m);
+            }
+            for (size_t i = n; i < bonesNew.size(); ++i) {
+                skinned.setMat4("finalBonesMatrices[" + std::to_string(i) + "]", bonesNew[i]);
+            }
+
+            if (w >= 1.0f) gFade.active = false;
+        }
+
+        // Model matrix
+        glm::mat4 M(1.0f);
+        M = glm::translate(M, player.pos + glm::vec3(0.0f, -0.4f, 0.0f));
+        M = glm::rotate(M, glm::radians(player.yawDeg), glm::vec3(0, 1, 0));
+        M = glm::scale(M, glm::vec3(0.8f));
+        skinned.setMat4("model", M);
+
+        player.model->Draw(skinned);
+
+        glfwSwapBuffers(window);
+        glfwPollEvents();
+    }
+
+    glfwTerminate();
+    return 0;
+}
